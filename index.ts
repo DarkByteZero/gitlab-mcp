@@ -260,6 +260,9 @@ import {
   CreateWorkItemNoteSchema,
   MoveWorkItemSchema,
   ListCustomFieldDefinitionsSchema,
+  ListWebhooksSchema,
+  ListWebhookEventsSchema,
+  GetWebhookEventSchema,
 } from "./schemas.js";
 
 import { randomUUID } from "node:crypto";
@@ -1473,6 +1476,24 @@ const allTools = [
       "Add a note/comment to a work item. Supports Markdown, internal notes, and threaded replies.",
     inputSchema: toJSONSchema(CreateWorkItemNoteSchema),
   },
+  {
+    name: "list_webhooks",
+    description:
+      "List all configured webhooks for a GitLab project or group. Provide either project_id or group_id.",
+    inputSchema: toJSONSchema(ListWebhooksSchema),
+  },
+  {
+    name: "list_webhook_events",
+    description:
+      "List recent webhook events (past 7 days) for a project or group webhook. Use summary mode for overview, then get_webhook_event for full details.",
+    inputSchema: toJSONSchema(ListWebhookEventsSchema),
+  },
+  {
+    name: "get_webhook_event",
+    description:
+      "Get full details of a specific webhook event by ID, including request/response payloads. Searches up to 500 most recent events.",
+    inputSchema: toJSONSchema(GetWebhookEventSchema),
+  },
 ];
 
 // Define which tools are read-only
@@ -1534,6 +1555,9 @@ const readOnlyTools = new Set([
   "list_work_item_statuses",
   "list_custom_field_definitions",
   "list_work_item_notes",
+  "list_webhooks",
+  "list_webhook_events",
+  "get_webhook_event",
 ]);
 
 // Define which tools are related to wiki and can be toggled by USE_GITLAB_WIKI
@@ -1589,7 +1613,8 @@ type ToolsetId =
   | "wiki"
   | "releases"
   | "users"
-  | "workitems";
+  | "workitems"
+  | "webhooks";
 
 interface ToolsetDefinition {
   readonly id: ToolsetId;
@@ -1785,6 +1810,15 @@ const TOOLSET_DEFINITIONS: readonly ToolsetDefinition[] = [
       "move_work_item",
       "list_work_item_notes",
       "create_work_item_note",
+    ]),
+  },
+  {
+    id: "webhooks",
+    isDefault: false,
+    tools: new Set([
+      "list_webhooks",
+      "list_webhook_events",
+      "get_webhook_event",
     ]),
   },
 ] as const;
@@ -6043,6 +6077,113 @@ async function listGroupProjects(
   return GitLabProjectSchema.array().parse(projects);
 }
 
+// Webhook API helper functions
+
+/**
+ * Build the base URL for webhooks (project or group)
+ */
+function buildWebhookBaseUrl(projectId?: string, groupId?: string): string {
+  if (projectId) {
+    projectId = decodeURIComponent(projectId);
+    return `${getEffectiveApiUrl()}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/hooks`;
+  }
+  const decodedGroupId = decodeURIComponent(groupId!);
+  return `${getEffectiveApiUrl()}/groups/${encodeURIComponent(decodedGroupId)}/hooks`;
+}
+
+/**
+ * List webhooks for a project or group
+ */
+async function listWebhooks(
+  options: z.infer<typeof ListWebhooksSchema>
+): Promise<unknown[]> {
+  const url = new URL(buildWebhookBaseUrl(options.project_id, options.group_id));
+
+  if (options.page) url.searchParams.append("page", options.page.toString());
+  if (options.per_page) url.searchParams.append("per_page", options.per_page.toString());
+
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
+  await handleGitLabError(response);
+  return (await response.json()) as unknown[];
+}
+
+/**
+ * Summarize webhook events by stripping heavy payload fields
+ */
+function summarizeWebhookEvents(events: Record<string, unknown>[]): Record<string, unknown>[] {
+  return events.map(event => ({
+    id: event.id,
+    url: event.url,
+    trigger: event.trigger,
+    response_status: event.response_status,
+    execution_duration: event.execution_duration,
+  }));
+}
+
+/**
+ * Fetch a single page of webhook events
+ */
+async function fetchWebhookEventsPage(
+  baseUrl: string,
+  page: number,
+  perPage: number,
+  status?: string | number
+): Promise<Record<string, unknown>[]> {
+  const url = new URL(baseUrl);
+  url.searchParams.set("page", page.toString());
+  url.searchParams.set("per_page", perPage.toString());
+  if (status !== undefined) url.searchParams.append("status", String(status));
+
+  const response = await fetch(url.toString(), { ...getFetchConfig() });
+  await handleGitLabError(response);
+  return (await response.json()) as Record<string, unknown>[];
+}
+
+/**
+ * List webhook events for a project or group webhook
+ */
+async function listWebhookEvents(
+  options: z.infer<typeof ListWebhookEventsSchema>
+): Promise<unknown[]> {
+  const eventsUrl = `${buildWebhookBaseUrl(options.project_id, options.group_id)}/${options.hook_id}/events`;
+
+  const events = await fetchWebhookEventsPage(
+    eventsUrl,
+    options.page ?? 1,
+    options.per_page ?? 20,
+    options.status
+  );
+  return options.summary ? summarizeWebhookEvents(events) : events;
+}
+
+/**
+ * Get a specific webhook event by ID (searches up to 500 recent events)
+ */
+async function getWebhookEvent(
+  options: z.infer<typeof GetWebhookEventSchema>
+): Promise<Record<string, unknown> | null> {
+  const eventsUrl = `${buildWebhookBaseUrl(options.project_id, options.group_id)}/${options.hook_id}/events`;
+  // GitLab enforces max per_page=20 for webhook events
+  const perPage = 20;
+
+  if (options.page) {
+    // Direct page lookup — single API call
+    const events = await fetchWebhookEventsPage(eventsUrl, options.page, perPage);
+    const match = events.find(e => e.id === options.event_id);
+    return match ?? null;
+  }
+
+  // Auto-paginate up to 500 events
+  const maxPages = 25;
+  for (let page = 1; page <= maxPages; page++) {
+    const events = await fetchWebhookEventsPage(eventsUrl, page, perPage);
+    const match = events.find(e => e.id === options.event_id);
+    if (match) return match;
+    if (events.length < perPage) break;
+  }
+  return null;
+}
+
 // Wiki API helper functions
 /**
  * List wiki pages in a project
@@ -9067,6 +9208,47 @@ async function handleToolCall(params: any) {
         );
         return {
           content: [{ type: "text", text: assetContent }],
+        };
+      }
+
+      case "list_webhooks": {
+        const args = ListWebhooksSchema.parse(params.arguments);
+        const webhooks = await listWebhooks(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(webhooks, null, 2) }],
+        };
+      }
+
+      case "list_webhook_events": {
+        const args = ListWebhookEventsSchema.parse(params.arguments);
+        const events = await listWebhookEvents(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(events, null, 2) }],
+        };
+      }
+
+      case "get_webhook_event": {
+        const args = GetWebhookEventSchema.parse(params.arguments);
+        const event = await getWebhookEvent(args);
+        if (!event) {
+          const searchScope = args.page
+            ? `on page ${args.page}`
+            : "in the 500 most recent events";
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: `Webhook event ${args.event_id} not found ${searchScope}` },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(event, null, 2) }],
         };
       }
 
