@@ -2738,7 +2738,7 @@ export const UpdateWorkItemSchema = WorkItemParamsSchema.extend({
   remove_labels: z.array(z.string()).optional().describe("Label names to remove"),
   assignee_usernames: z.array(z.string()).optional().describe("Set assignees by username (replaces existing)"),
   state_event: z.enum(["close", "reopen"]).optional().describe("Close or reopen the work item"),
-  weight: z.number().optional().describe("Set weight"),
+  weight: z.number().optional().describe("Set weight (issues, tasks, epics only)"),
   status: z.string().optional().describe("Set status by ID. Use list_work_item_statuses to get available status IDs."),
   parent_iid: z.number().optional().describe("Set parent work item by IID. Use with parent_project_id if parent is in a different project."),
   parent_project_id: z.coerce.string().optional().describe("Project ID or path of the parent work item (defaults to same project as the work item)"),
@@ -2751,7 +2751,7 @@ export const UpdateWorkItemSchema = WorkItemParamsSchema.extend({
     project_id: z.coerce.string().describe("Project ID or path of the child work item"),
     iid: z.number().describe("IID of the child work item"),
   })).optional().describe("Array of children to remove from this work item's hierarchy"),
-  health_status: z.enum(["onTrack", "needsAttention", "atRisk"]).optional().describe("Set health status"),
+  health_status: z.enum(["onTrack", "needsAttention", "atRisk"]).optional().describe("Set health status on issues and epics"),
   start_date: z.string().optional().describe("Start date in YYYY-MM-DD format"),
   due_date: z.string().optional().describe("Due date in YYYY-MM-DD format"),
   milestone_id: z.string().optional().describe("Milestone ID (GitLab global ID format, e.g. 'gid://gitlab/Milestone/123', or numeric ID)"),
@@ -2773,6 +2773,14 @@ export const UpdateWorkItemSchema = WorkItemParamsSchema.extend({
     selected_option_ids: z.array(z.string()).optional().describe("Selected option IDs (for select fields)"),
     date_value: z.string().optional().describe("Date value in YYYY-MM-DD format (for date fields)"),
   })).optional().describe("Custom field values to set"),
+  severity: z
+    .enum(["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"])
+    .optional()
+    .describe("Incident only: set severity level"),
+  escalation_status: z
+    .enum(["TRIGGERED", "ACKNOWLEDGED", "RESOLVED", "IGNORED"])
+    .optional()
+    .describe("Incident only: set escalation status"),
 });
 
 export const ConvertWorkItemTypeSchema = z.object({
@@ -2831,15 +2839,15 @@ export const ListWebhooksSchema = z
     project_id: z.coerce
       .string()
       .optional()
-      .describe("Project ID or URL-encoded path. Provide either project_id or group_id."),
+      .describe("Project ID or URL-encoded path. Provide either project_id or group_id, not both."),
     group_id: z.coerce
       .string()
       .optional()
-      .describe("Group ID or URL-encoded path. Provide either project_id or group_id."),
+      .describe("Group ID or URL-encoded path. Provide either project_id or group_id, not both."),
   })
   .merge(PaginationOptionsSchema)
-  .refine(data => data.project_id || data.group_id, {
-    message: "Either project_id or group_id must be provided",
+  .refine(data => (data.project_id || data.group_id) && !(data.project_id && data.group_id), {
+    message: "Provide exactly one of project_id or group_id",
   });
 
 export const ListWebhookEventsSchema = z
@@ -2847,12 +2855,12 @@ export const ListWebhookEventsSchema = z
     project_id: z.coerce
       .string()
       .optional()
-      .describe("Project ID or URL-encoded path. Provide either project_id or group_id."),
+      .describe("Project ID or URL-encoded path. Provide either project_id or group_id, not both."),
     group_id: z.coerce
       .string()
       .optional()
-      .describe("Group ID or URL-encoded path. Provide either project_id or group_id."),
-    hook_id: z.number().describe("ID of the webhook"),
+      .describe("Group ID or URL-encoded path. Provide either project_id or group_id, not both."),
+    hook_id: z.coerce.number().describe("ID of the webhook"),
     status: z
       .union([z.number(), z.string()])
       .optional()
@@ -2865,10 +2873,16 @@ export const ListWebhookEventsSchema = z
       .describe(
         "If true, return only summary fields (id, url, trigger, response_status, execution_duration) without full request/response payloads. Recommended for overview queries to avoid huge responses."
       ),
+    per_page: z
+      .number()
+      .max(20)
+      .optional()
+      .default(20)
+      .describe("Number of events per page"),
+    page: z.number().optional().describe("Page number for pagination"),
   })
-  .merge(PaginationOptionsSchema)
-  .refine(data => data.project_id || data.group_id, {
-    message: "Either project_id or group_id must be provided",
+  .refine(data => (data.project_id || data.group_id) && !(data.project_id && data.group_id), {
+    message: "Provide exactly one of project_id or group_id",
   });
 
 export const GetWebhookEventSchema = z
@@ -2876,13 +2890,13 @@ export const GetWebhookEventSchema = z
     project_id: z.coerce
       .string()
       .optional()
-      .describe("Project ID or URL-encoded path. Provide either project_id or group_id."),
+      .describe("Project ID or URL-encoded path. Provide either project_id or group_id, not both."),
     group_id: z.coerce
       .string()
       .optional()
-      .describe("Group ID or URL-encoded path. Provide either project_id or group_id."),
-    hook_id: z.number().describe("ID of the webhook"),
-    event_id: z.number().describe("ID of the webhook event to retrieve"),
+      .describe("Group ID or URL-encoded path. Provide either project_id or group_id, not both."),
+    hook_id: z.coerce.number().describe("ID of the webhook"),
+    event_id: z.coerce.number().describe("ID of the webhook event to retrieve"),
     page: z
       .number()
       .optional()
@@ -2890,11 +2904,24 @@ export const GetWebhookEventSchema = z
         "If known, the page where the event is located (from list_webhook_events). Skips auto-pagination and fetches only this page."
       ),
   })
-  .refine(data => data.project_id || data.group_id, {
-    message: "Either project_id or group_id must be provided",
+  .refine(data => (data.project_id || data.group_id) && !(data.project_id && data.group_id), {
+    message: "Provide exactly one of project_id or group_id",
   });
 
-// Webhook types
-export type ListWebhooksOptions = z.infer<typeof ListWebhooksSchema>;
-export type ListWebhookEventsOptions = z.infer<typeof ListWebhookEventsSchema>;
-export type GetWebhookEventOptions = z.infer<typeof GetWebhookEventSchema>;
+// --- Incident Timeline Event schemas ---
+
+export const GetTimelineEventsSchema = z.object({
+  project_id: z.coerce.string().describe("Project ID or URL-encoded path"),
+  incident_iid: z.number().describe("The internal ID (IID) of the incident"),
+});
+
+export const CreateTimelineEventSchema = z.object({
+  project_id: z.coerce.string().describe("Project ID or URL-encoded path"),
+  incident_iid: z.number().describe("The internal ID (IID) of the incident"),
+  note: z.string().describe("Description of the timeline event (Markdown supported)"),
+  occurred_at: z.string().describe("When the event occurred in ISO 8601 format (e.g. '2026-03-15T09:00:00.000Z')"),
+  tag_names: z
+    .array(z.enum(["Start time", "End time", "Impact detected", "Response initiated", "Impact mitigated", "Cause identified"]))
+    .optional()
+    .describe("Timeline event tags to attach. Available: 'Start time', 'End time', 'Impact detected', 'Response initiated', 'Impact mitigated', 'Cause identified'."),
+});
